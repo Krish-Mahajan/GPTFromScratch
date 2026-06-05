@@ -207,37 +207,140 @@ Sin/cos stays bounded [-1, 1], works at any length, and encodes relative distanc
 
 ### Transformer Block
 
-One complete block:
-1. Multi-Head Self-Attention
-2. Add (residual connection) + LayerNorm
-3. Feed-Forward Network (Linear → GELU → Linear, expanding 4×)
-4. Add (residual connection) + LayerNorm
+One complete block has 4 components:
 
-Stack N of these blocks = a Transformer.
+| Component | What it does |
+|-----------|-------------|
+| Multi-Head Attention | Words talk to each other (communication) |
+| Feed-Forward Network | Each word processes individually (computation) |
+| LayerNorm (×2) | Normalizes values to prevent explosion/shrinkage |
+| Dropout (×2) | Randomly zeros values during training (prevents overfitting) |
+
+**Forward pass:**
+```python
+x = LayerNorm1(x + Dropout(Attention(x)))   # communicate → normalize
+x = LayerNorm2(x + Dropout(FFN(x)))          # think → normalize
+```
+
+Each sub-layer wrapped with a residual connection. Stack N of these blocks = a Transformer.
 
 ### Residual Connections
 
 ```
-output = LayerNorm(x + sublayer(x))
+output = x + sublayer(x)
 ```
 
-Allows gradients to flow directly through the network without degradation. Without them, deep stacks of blocks wouldn't train.
+The output is the **original input plus** what the sub-layer computed. Why:
+- Gradients flow directly through the `+ x` path without degradation
+- Deep stacks (12, 24, 96 layers) can train without vanishing gradients
+- The sub-layer only needs to learn the "delta" — what to add, not rebuild from scratch
 
-### Feed-Forward Network
+Also why FFN and attention must output the same shape as their input — addition requires matching shapes.
 
-Applied independently to each position:
+### LayerNorm
+
+Normalizes each word's vector to mean=0, std=1, then applies learned scale (γ) and shift (β).
+
+**Example:** word vector [4.0, 2.0, 0.0, 2.0]
 ```
-FFN(x) = Linear2(GELU(Linear1(x)))
+mean = 2.0, std = 1.41
+normalized = [(4-2)/1.41, (2-2)/1.41, (0-2)/1.41, (2-2)/1.41]
+           = [1.41, 0.0, -1.41, 0.0]
+output = γ * normalized + β   (γ, β are learned)
 ```
-Where Linear1 expands: d_model → 4×d_model, and Linear2 compresses back: 4×d_model → d_model.
+
+Normalizes across dimensions *within one word* — independent of batch size and other positions.
+
+**Why LayerNorm instead of BatchNorm?**
+- BatchNorm normalizes across the batch (needs multiple examples) — breaks with variable sequence lengths, padding, and batch=1 at inference
+- LayerNorm normalizes within a single word — works identically whether batch=1 or batch=1000
+
+### Dropout
+
+During training, randomly zeros values with probability p (e.g., 0.1 = 10% killed):
+```
+Input:   [0.5, 1.2, 0.8, 0.3, 1.0, 0.7]
+Training: [0.5, 0.0, 0.8, 0.0, 1.0, 0.7]  ← random values zeroed, survivors scaled up
+Inference: [0.5, 1.2, 0.8, 0.3, 1.0, 0.7]  ← everything passes through unchanged
+```
+
+Forces redundancy — neurons can't rely on specific partners, so the model generalizes better. Different random mask each training step.
+
+### Feed-Forward Network (FFN)
+
+A 2-layer MLP applied independently to each word position:
+```
+x (1,6,16) → Linear1 (16→64) → GELU → Linear2 (64→16) → output (1,6,16)
+```
+
+- **Expand 4×** then **compress back** — gives a bigger "workspace" for complex transformations
+- **GELU activation** — non-linearity between layers; without it, two linear layers collapse into one matrix
+- **Independent per word** — word 0's FFN computation doesn't see word 1 (that's attention's job)
+
+Think of it as:
+- Attention = group discussion (words share information)
+- FFN = individual thinking (each word processes what it heard)
+
+### Parameter Count (d_model=32, num_heads=4, d_ff=128)
+
+```
+Attention:
+  W_q: 32×32 = 1,024    ← weight matrix (no bias)
+  W_k: 32×32 = 1,024
+  W_v: 32×32 = 1,024
+  W_o: 32×32 = 1,024
+                 subtotal: 4,096
+
+FFN:
+  Linear1: 32×128 + 128(bias) = 4,224
+  Linear2: 128×32 + 32(bias)  = 4,128
+                 subtotal: 8,352
+
+LayerNorm (×2):
+  γ(32) + β(32) = 64 each × 2 = 128
+
+Total per block: 4,096 + 8,352 + 128 = 12,576
+```
+
+Note: nn.Linear(in, out) has in×out weight params + out bias params.
 
 ### Complete Transformer Decoder (GPT-style)
 
+**Pipeline:**
 ```
 Input tokens → Token Embedding × √d_model → + Positional Encoding
   → Transformer Block × N
   → LayerNorm → Linear → logits over vocabulary
 ```
+
+**What's learnable vs fixed:**
+
+| Component | Learnable? | Why |
+|-----------|-----------|-----|
+| nn.Embedding | Yes | Table rows trained to capture word meaning |
+| nn.Linear | Yes | Weight matrix + bias adjusted by gradient descent |
+| LayerNorm (γ, β) | Yes | Scale and shift are tuned |
+| PositionalEncoding | No | Fixed sin/cos formula |
+| Dropout | No | Random mask, no parameters |
+| Causal mask | No | Fixed upper triangle pattern |
+
+**Where the parameters live** (vocab=20, d_model=32, heads=4, layers=3):
+
+```
+┌─────────────────────────────────────┬────────┬───────┐
+│ Component                           │ Params │   %   │
+├─────────────────────────────────────┼────────┼───────┤
+│ FFN Linear layers (×3 blocks)       │ 25,056 │ 59.1% │
+│ Attention W_q,W_k,W_v,W_o (×3)     │ 12,288 │ 29.0% │
+│ Output Projection (32→20)           │    660 │  1.6% │
+│ Token Embedding (20×32)             │    640 │  1.5% │
+│ LayerNorm γ,β (7 total)             │    448 │  1.1% │
+│                                     │        │       │
+│ TOTAL                               │ 15,764 │  100% │
+└─────────────────────────────────────┴────────┴───────┘
+```
+
+~90% of parameters live in FFN (59%) and Attention (29%). This ratio holds at any scale — GPT-3's 175B params follow the same distribution. The 4× expansion in FFN (d_model → 4×d_model → d_model) is why FFN dominates.
 
 ## Architecture Comparison
 
